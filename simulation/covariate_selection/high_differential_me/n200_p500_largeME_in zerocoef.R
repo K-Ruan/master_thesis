@@ -1,0 +1,699 @@
+library(hdme)
+library(ggplot2)
+library(ROCit)
+library(pracma)
+library(quadprog)
+### helper function
+
+library(Rglpk)
+library(glmnet)
+
+# Logistic functions
+logit <- function(x) (1+exp(-x))^(-1)
+dlogit <- function(x) exp(-x)*(1+exp(-x))^(-2)
+
+# Poisson functions
+pois <- function(x) exp(x)
+dpois <- function(x) exp(x)
+
+
+###
+musalgorithm <- function(W, y, merror, lambda, delta, weights = NULL){
+  # We assume the first column of W is constants, i.e., intercept
+  n <- dim(W)[1]
+  p <- dim(W)[2]
+  obj <- c(rep(1,p),rep(0,p)) #!there is no mistake here
+  mat <- matrix(0,nrow=4*p, ncol=2*p)
+  vec_merror<-diag(merror) #diagonal elements of the diagonal matrix
+  
+  # Weight matrix
+  if(is.null(weights)){
+    D <- diag(n)
+  } else {
+    D <- diag(weights)
+  }
+  
+  #variable= (u_1,...,u_p,b_1,...,b_p)
+  #obj_coef=(rep(0,p),rep(1,p))
+  
+  # Inequality constraint, -u_j - beta_j <= 0
+  mat[1:p,1:p] <- -diag(p)
+  mat[1:p,(p+1):(2*p)] <- -diag(p)
+  
+  # Inequality constraint, -u_j + beta_j <= 0
+  mat[(p+1):(2*p),1:p] <- -diag(p)
+  mat[(p+1):(2*p),(p+1):(2*p)] <- diag(p)
+  
+  transient_mat<-matrix(rep(c(1,vec_merror),p-1),nrow=p-1,ncol = p, byrow = T)
+  
+  # First "score function" constraint
+  mat[(2*p+1),1:p] <- matrix(0, nrow=1, ncol=p) # intercept?
+  mat[(2*p+2):(3*p),1:p] <- (-delta)*transient_mat
+  mat[(2*p+1):(3*p),(p+1):(2*p)] <- 1/n*(t(W) %*% D %*% W)
+  
+  # Second "score function" constraint
+  mat[(3*p+1),1:p] <- matrix(0, nrow=1, ncol=p)
+  mat[(3*p+2):(4*p),1:p] <- (-delta)*transient_mat
+  mat[(3*p+1):(4*p),(p+1):(2*p)] <- -1/n*(t(W) %*% D %*% W)
+  
+  rhs <- rep(0,(4*p))
+  rhs[(2*p+1)] <- 1/n*(t(W[,1]) %*% D %*% y)
+  rhs[(2*p+2):(3*p)] <- lambda + 1/n*(t(W[,-1]) %*% D %*% y)
+  rhs[(3*p+1)] <- -1/n*(t(W[,1]) %*% D %*% y)
+  rhs[(3*p+2):(4*p)] <- lambda - 1/n*(t(W[,-1]) %*% D %*% y)
+  dir <- rep("<=",4*p)
+  bounds <- list(lower=list(ind=1:(2*p), val=rep(-Inf,2*p)),
+                 upper=list(ind=1:(2*p), val=rep(Inf,2*p)))
+  
+  
+  
+  
+  bhat <- Rglpk::Rglpk_solve_LP(obj = obj, mat = mat, dir = dir,
+                                rhs = rhs, bounds = bounds)$solution
+  
+  
+  return(bhat[(p+1):(2*p)])
+  
+  
+}
+
+#merror:= covariate specific measurement error
+#merror= diag(\sigma_1,...,\sigma_p) p*p matrix
+mus_glm <- function(W, y, merror, lambda, delta, family = c("binomial", "poisson"), weights = NULL){
+  
+  family <- match.arg(family)
+  
+  if(family == "binomial") {
+    mu <- logit
+    dmu <- dlogit
+  } else if(family == "poisson") {
+    mu <- pois
+    dmu <- dpois
+  }
+  
+  
+  n <- dim(W)[1]
+  p <- dim(W)[2]
+  
+  bOld <- stats::rnorm(p)/p
+  bNew <- stats::rnorm(p)/p
+  IRLSeps <- 1e-7
+  maxit <- 100
+  count <- 1
+  Diff1 <- 1
+  Diff2 <- 1
+  
+  while(Diff1 > IRLSeps & Diff2 > IRLSeps & count < maxit){
+    bOlder <- bOld
+    bOld <- bNew
+    V <- dmu(W%*%bOld)
+    z <- W%*%bOld + (y - mu(W%*%bOld))/dmu(W%*%bOld)
+    Wtilde <- c(sqrt(V)) * W
+    ztilde <- c(sqrt(V)) * c(z)
+    bNew <- musalgorithm(Wtilde, ztilde, merror, lambda, delta * sqrt(sum((V)^2)) / sqrt(n), weights)
+    
+    count <- count+1
+    Diff1 <- sum(abs(bNew - bOld))
+    Diff2 <- sum(abs(bNew - bOlder))
+  }
+  if(count >= maxit) print("Did not converge")
+  return(bNew)
+}
+
+#merror:= covariate specific measurement error
+#merror= diag(\sigma_1,...,\sigma_p) p*p matrix
+
+gmus <- function(W, y, merror, lambda = NULL, delta = NULL,
+                 family = "gaussian", weights = NULL) {
+  
+  family <- match.arg(family, choices = c("gaussian", "binomial", "poisson"))
+  
+  if(!is.null(weights) & length(weights) != nrow(W)) stop("weights vector must be one value per case")
+  
+  if(is.null(lambda)) {
+    lambda <- glmnet::cv.glmnet(W, y, family = family)$lambda.min
+  } else {
+    stopifnot(all(lambda >= 0))
+  }
+  if(is.null(delta)) {
+    delta <- seq(from = 0, to = 0.5, by = 0.02)
+  } else {
+    stopifnot(all(delta >= 0))
+  }
+  
+  n <- dim(W)[1]
+  p <- dim(W)[2] + 1
+  W <- scale(W,center = T,scale = T)
+  scales <- attr(W, "scaled:scale") 
+  W <- cbind(rep(1,n), W) # add a column consisting of "1"s, representing the intercepts
+  
+  if(family == "gaussian") {
+    fit <- sapply(delta, function(delta) musalgorithm(W, y, lambda, delta, weights))
+  } else if(family %in% c("binomial", "poisson")) {
+    fit <- sapply(delta, function(delta) mus_glm(W, y, merror, lambda, delta, family, weights))
+  }
+  
+  
+  fit <- list(intercept = fit[1, ],
+              beta = matrix(fit[2:p, ] / scales, nrow = p - 1),
+              family = family,
+              delta = delta,
+              lambda = lambda,
+              num_non_zero = colSums(abs(fit[2:p, , drop = FALSE]) > 1e-10)
+  )
+  
+  class(fit) <- "gmus"
+  return(fit)
+}
+
+########################
+#library(hdme)
+create_example_data <- function(n, p, s = 5, sdX = 1, sdU = 0.5, 
+                                sdEpsilon = 0.1, family = "gaussian") {
+  # Independent true covariates with mean zero and standard deviation sdX
+  X <- matrix(rnorm(n * p, sd = sdX), nrow = n, ncol = p)
+  # if Gaussian, response has standard deviation sdEpsilon, and zero intercept
+  # if binomial, response is binomial with mean (1 + exp(-X %*% beta))^(-1)
+  beta <- c(-2, -1, 0.5, 1, 2, rep(0, p - s))
+  
+  if(family == "gaussian") {
+    # True coefficient vector has s non-zero elements and p-s zero elements
+    y <- X %*% beta + rnorm(n, sd = sdEpsilon)  
+  } else if (family == "binomial") {
+    # Need an amplification in the binomial case
+    beta <- beta * 3
+    y <- rbinom(n, size = 1, prob = (1 + exp(-X %*% beta))**(-1))
+  }
+  
+  # The measurements W have mean X and standard deviation sdU. 
+  # We assume uncorrelated measurement errors
+  W <- X + matrix(rnorm(n * p, sd = sdU), nrow = n, ncol = p)
+  
+  return(list(X = X, W = W, y = y, beta = beta, sigmaUU = diag(p) * sdU))  
+}
+
+# data generating mechnism
+generate_logistic_data<-function(n,p,s,beta,sdU,sdX){ #sdU: p*p diagonal matrix 
+  vec_merror=diag(sdU) #length of vec == p
+  dataXtrue<-c()
+  dataXobs<-c()
+  for(i in 1:p){
+    onecol_trueX<-rnorm(n,sd=sdX)
+    onecol_obsX<-onecol_trueX+rnorm(n,sd=vec_merror[i])
+    dataXtrue<-c(dataXtrue,onecol_trueX)
+    dataXobs<-c(dataXobs,onecol_obsX)
+  }
+  X<-matrix(data = dataXtrue,nrow = n, ncol = p, byrow = F)
+  W<-matrix(data = dataXobs, nrow = n, ncol = p, byrow = F)
+  y=rbinom(n, size = 1, prob = (1 + exp(-X %*% beta))**(-1))
+  
+  return(list(X = X, W = W, y = y, beta = beta, sigmaUU = sdU)) 
+}
+
+
+smoothing<-function(x){
+  output<-numeric(length(x))
+  for (i in 1:(length(x)-1)){
+    if (x[i]<= min(x[-(1:i)])) output[i]<-x[i]
+    if (x[i] > min(x[-(1:i)])) {
+      x[i:(i+which.min(x[-(1:i)]))]<-mean(x[i:(i+which.min(x[-(1:i)]))])
+      output[i:(i+which.min(x[-(1:i)]))]<-mean(x[i:(i+which.min(x[-(1:i)]))])
+    } 
+  }
+  output[length(x)]<-x[length(x)]
+  return(output)
+}
+
+getmode <- function(v) {
+  uniqv <- unique(v)
+  uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+#######################################
+#######################################
+#######################################
+#######################################
+#######################################
+#######################################
+#######################################
+#######################################
+#######################################
+
+
+
+#mos=log10(c(1.5,3,6,20,40,70,100,1e5,1e10,1e20)) #here it is: max(me)/sdX
+
+mos=0.2 #here it is: max(me)/sdX
+
+est_beta_gmus<-c() ##   B=100
+est_beta_gmus0<-c() ##   B=100
+est_beta_gmus00<-c() ## B=100
+
+performance<-c()
+counts_nr=0
+
+nonzero_coef_gmus<-c() #to calculate MonteCarlo mean of #non-zero coef in the elbow plot
+nonzero_coef_gmus0<-c()
+nonzero_coef_gmus00<-c()
+
+for(MOS in 1:length(mos)){
+  
+  counts_nr=counts_nr+1
+  cat(counts_nr,"-th me/sdx start \n")
+  
+  n=200
+  p=500
+  s=10
+  beta <- c(rep(1,times=s),rep(0,times=p-s))
+  
+  set.seed(1)
+  me<-mos*c(abs(rnorm(s,mean=1,sd=0.2)),10*abs(rnorm(p-s,mean=1,sd = 0.2)) )
+  sdU=diag(x=me,nrow=p)
+  sdX=1
+  B=100
+  
+  for (bstar in 1:B){
+    
+    set.seed(20211215+10*bstar)
+    ll=generate_logistic_data(n=n,p=p,s=s,beta=beta,sdU=sdU,sdX=sdX)
+    
+    ## gmus
+    merror=ll$sigmaUU
+    gmus_fit <- gmus(ll$W, ll$y,merror=merror, family = "binomial")
+    
+    grid_nonzero_coef<-apply(gmus_fit$beta,MARGIN = 2, FUN=function(x){
+      sum(abs(x)>1e-10)
+    })
+    nonzero_coef_gmus<-rbind(nonzero_coef_gmus, t(grid_nonzero_coef)   )
+    
+    #gmus0
+    merror_equal=diag(rep(sqrt(mean(diag(ll$sigmaUU)^2)),times=length(diag(ll$sigmaUU))))
+    gmus0_fit <- gmus(ll$W, ll$y,merror=merror_equal,
+                      lambda=gmus_fit$lambda, family = "binomial")
+    
+    grid_nonzero_coef<-apply(gmus0_fit$beta,MARGIN = 2, FUN=function(x){
+      sum(abs(x)>1e-10)
+    })
+    nonzero_coef_gmus0<-rbind(nonzero_coef_gmus0, t(grid_nonzero_coef)   )
+    
+    #gmus00 
+    gmus00_fit<-hdme::gmus(ll$W, ll$y,lambda=gmus_fit$lambda, family = "binomial")
+    grid_nonzero_coef<-apply(gmus00_fit$beta,MARGIN = 2, FUN=function(x){
+      sum(abs(x)>1e-10)
+    })
+    nonzero_coef_gmus00<-rbind(nonzero_coef_gmus00,t(grid_nonzero_coef))
+  }
+}   
+
+
+##LOAD dataset here
+load(file="nonzero_coef_gmus_me02_sample200_largeME0coef.RData")
+load(file="nonzero_coef_gmus0_me02_sample200_largeME0coef.RData")
+load(file="nonzero_coef_gmus00_me02_sample200_largeME0coef.RData")
+
+#save dataset here
+#save(nonzero_coef_gmus,file="nonzero_coef_gmus_me02_sample200_largeME0coef.RData")
+#save(nonzero_coef_gmus0,file="nonzero_coef_gmus0_me02_sample200_largeME0coef.RData")
+#save(nonzero_coef_gmus00,file="nonzero_coef_gmus00_me02_sample200_largeME0coef.RData")
+
+####
+delta_grid<-seq(0,0.5,by=0.02)
+
+MonteCarlo_NCmean_gmus<-colMeans(nonzero_coef_gmus)
+slope_gmus<-(MonteCarlo_NCmean_gmus[1:25]-MonteCarlo_NCmean_gmus[2:26])/(delta_grid[1:25]-delta_grid[2:26])
+smooth_slope_gmus<-smoothing(slope_gmus)
+
+MonteCarlo_NCmean_gmus0<-colMeans(nonzero_coef_gmus0)
+slope_gmus0<-(MonteCarlo_NCmean_gmus0[1:25]-MonteCarlo_NCmean_gmus0[2:26])/(delta_grid[1:25]-delta_grid[2:26])
+smooth_slope_gmus0<-smoothing(slope_gmus0)
+
+MonteCarlo_NCmean_gmus00<-colMeans(nonzero_coef_gmus00)
+slope_gmus00<-(MonteCarlo_NCmean_gmus00[1:25]-MonteCarlo_NCmean_gmus00[2:26])/(delta_grid[1:25]-delta_grid[2:26])
+smooth_slope_gmus00<-smoothing(slope_gmus00)
+
+########## first run till here
+
+
+
+#then choose delta
+plot(0:25,MonteCarlo_NCmean_gmus) # NC =  nonzero coef
+plot(1:25,y=smooth_slope_gmus)
+
+plot(0:25,MonteCarlo_NCmean_gmus0)
+plot(1:25,y=smooth_slope_gmus0)
+
+plot(0:25,MonteCarlo_NCmean_gmus00)
+plot(1:25,y=smooth_slope_gmus00)
+
+
+
+delta_esti_gmus_006<-0.06 #NC ~= 8.5 
+delta_esti_gmus_005<-0.05 #NC ~= 11.0
+delta_esti_gmus_004<-0.04 #NC ~= 13.4
+delta_esti_gmus_003<-0.03 #NC ~= 18.7
+delta_esti_gmus_002<-0.02 #NC ~= 24.1
+
+delta_esti_gmus0_008<- 0.08 #NC ~= 10.6
+delta_esti_gmus0_006<- 0.06 #NC ~= 12.4
+delta_esti_gmus0_004<- 0.04 #NC ~= 15.7
+delta_esti_gmus0_003<- 0.03 #NC ~= 19.2
+delta_esti_gmus0_002<- 0.02 #NC ~= 22.8
+
+delta_esti_gmus00_014<-  0.14 #NC ~= 11.2
+delta_esti_gmus00_010 <- 0.10 #NC ~= 13.5
+delta_esti_gmus00_008<-  0.08 #NC ~= 15.5
+delta_esti_gmus00_006<-  0.06 #NC ~= 18.5
+delta_esti_gmus00_004<-  0.04 #NC ~= 22.7
+
+###########plot
+
+par(mfrow=c(1,1))
+plot(delta_grid,MonteCarlo_NCmean_gmus,
+     main="Elbow plot, ME setting 3",
+     xlab = expression(delta),
+     ylab = "No. nonzero coefficients",
+     type="l",lty=1)
+points(c(0.06,0.05,0.04,0.03,0.02),
+       y=c(MonteCarlo_NCmean_gmus[4],mean(MonteCarlo_NCmean_gmus[c(3,4)]),MonteCarlo_NCmean_gmus[3],mean(MonteCarlo_NCmean_gmus[c(2,3)]),MonteCarlo_NCmean_gmus[2]),
+       col="red",pch=20)
+lines(delta_grid,MonteCarlo_NCmean_gmus0,
+      lty=2)
+points(c(0.08,0.06,0.04,0.03,0.02),y=c(MonteCarlo_NCmean_gmus0[c(5,4,3)],mean(MonteCarlo_NCmean_gmus0[c(2,3)]),MonteCarlo_NCmean_gmus0[2]),
+       col="red",pch=20)
+lines(delta_grid,MonteCarlo_NCmean_gmus00,
+      lty=3)
+points(c(0.14,0.10,0.08,0.06,0.04),y=MonteCarlo_NCmean_gmus00[c(8,6,5,4,3)],
+       col="red",pch=20)
+
+legend(0.3, 40, legend=c("CGMUS", "Equal ME CGMUS","GMUS"),
+       lty=c(1,2,3), cex=0.7)
+
+
+###########
+
+
+
+## simulation, 100 dataset (each dataset use same set of coveriate-specific ME, sdX ) 
+
+gmus_beta_006<-c()
+gmus_beta_005<-c()
+gmus_beta_004<-c()
+gmus_beta_003<-c()
+gmus_beta_002<-c()
+
+gmus0_beta_008<-c()
+gmus0_beta_006<-c()
+gmus0_beta_004<-c()
+gmus0_beta_003<-c()
+gmus0_beta_002<-c()
+
+gmus00_beta_014<-c()
+gmus00_beta_010<-c()
+gmus00_beta_008<-c()
+gmus00_beta_006<-c()
+gmus00_beta_004<-c()
+
+gds_beta<-c()
+lasso_beta<-c()
+
+B=100
+
+for (bstar in 1:B){
+  
+  set.seed(20211215+10*bstar)
+  ll=generate_logistic_data(n=n,p=p,s=s,beta=beta,sdU=sdU,sdX=sdX)
+  
+  ## gmus
+
+  merror=ll$sigmaUU
+  gmus_fit2 <- gmus(ll$W, ll$y,merror=merror,
+                    delta=delta_esti_gmus_006, family = "binomial")
+  gmus_beta_006<-rbind(gmus_beta_006,t(gmus_fit2$beta))
+  
+  lambda_min<-gmus_fit2$lambda
+  
+  gmus_fit2 <- gmus(ll$W, ll$y,merror=merror, lambda= lambda_min,
+                    delta=delta_esti_gmus_005, family = "binomial")
+  gmus_beta_005<-rbind(gmus_beta_005,t(gmus_fit2$beta))
+  
+  gmus_fit2 <- gmus(ll$W, ll$y,merror=merror, lambda= lambda_min,
+                    delta=delta_esti_gmus_004, family = "binomial")
+  gmus_beta_004<-rbind(gmus_beta_004,t(gmus_fit2$beta))
+  
+  gmus_fit2 <- gmus(ll$W, ll$y,merror=merror, lambda= lambda_min,
+                    delta=delta_esti_gmus_003, family = "binomial")
+  gmus_beta_003<-rbind(gmus_beta_003,t(gmus_fit2$beta))
+  
+  gmus_fit2 <- gmus(ll$W, ll$y,merror=merror, lambda= lambda_min,
+                    delta=delta_esti_gmus_002, family = "binomial")
+  gmus_beta_002<-rbind(gmus_beta_002,t(gmus_fit2$beta))
+  
+  ## logistic lasso, lambda.min
+  logistic_lasso_fit<-glmnet::glmnet(x=ll$W, y=ll$y, family = "binomial",
+                                     lambda=lambda_min,alpha=1)
+  lasso_beta<-rbind(lasso_beta,t(logistic_lasso_fit$beta))
+  
+  #gmus0
+  merror_equal=diag(rep(sqrt(mean(diag(ll$sigmaUU)^2)),times=length(diag(ll$sigmaUU))))
+  gmus0_fit2 <- gmus(ll$W, ll$y,merror=merror_equal, lambda=lambda_min,
+                     delta=delta_esti_gmus0_008, family = "binomial")
+  gmus0_beta_008<-rbind(gmus0_beta_008,t(gmus0_fit2$beta))
+  
+  gmus0_fit2 <- gmus(ll$W, ll$y,merror=merror_equal, lambda=lambda_min,
+                     delta=delta_esti_gmus0_006, family = "binomial")
+  gmus0_beta_006<-rbind(gmus0_beta_006,t(gmus0_fit2$beta))
+  
+  gmus0_fit2 <- gmus(ll$W, ll$y,merror=merror_equal, lambda= lambda_min,
+                     delta=delta_esti_gmus0_004, family = "binomial")
+  gmus0_beta_004<-rbind(gmus0_beta_004,t(gmus0_fit2$beta))
+  
+  gmus0_fit2 <- gmus(ll$W, ll$y,merror=merror_equal, lambda= lambda_min,
+                     delta=delta_esti_gmus0_003, family = "binomial")
+  gmus0_beta_003<-rbind(gmus0_beta_003,t(gmus0_fit2$beta))
+  
+  gmus0_fit2 <- gmus(ll$W, ll$y,merror=merror_equal, lambda= lambda_min,
+                     delta=delta_esti_gmus0_002, family = "binomial")
+  gmus0_beta_002<-rbind(gmus0_beta_002,t(gmus0_fit2$beta))
+  #gds 
+  gds_fit<-hdme::gds(ll$W,ll$y,lambda= lambda_min, family = "binomial")
+  gds_beta<-rbind(gds_beta,t(gds_fit$beta))
+  
+  #gmus00 delta=0.06
+  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_014,
+                         lambda = lambda_min,family="binomial")
+  gmus00_beta_014<-rbind(gmus00_beta_014,t(gmus00_fit$beta))
+  
+  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_010,
+                         lambda = lambda_min,family="binomial")
+  gmus00_beta_010<-rbind(gmus00_beta_010,t(gmus00_fit$beta))
+  
+  #gmus00 delta= 5 valuea
+  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_008,
+                         lambda = lambda_min, family="binomial")
+  gmus00_beta_008<-rbind(gmus00_beta_008,t(gmus00_fit$beta))
+  
+  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_006,
+                         lambda = lambda_min, family="binomial")
+  gmus00_beta_006<-rbind(gmus00_beta_006,t(gmus00_fit$beta))
+  
+  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_004,
+                         lambda = lambda_min, family="binomial")
+  gmus00_beta_004<-rbind(gmus00_beta_004,t(gmus00_fit$beta))
+}
+
+
+#for (bstar in 1:B){ #gmus00 delta=0.08 delta=0.06
+#  
+#  set.seed(20211215+10*bstar)
+#  ll=generate_logistic_data(n=n,p=p,s=s,beta=beta,sdU=sdU,sdX=sdX)
+#  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00,family="binomial")
+#  gmus00_beta<-rbind(gmus00_beta,t(gmus00_fit$beta))
+#  
+#}
+
+
+#for (bstar in 1:B){ #gmus00 delta=0.08
+#  
+#  set.seed(20211215+10*bstar)
+#  ll=generate_logistic_data(n=n,p=p,s=s,beta=beta,sdU=sdU,sdX=sdX)
+#  gmus00_fit<-hdme::gmus(ll$W,ll$y,delta=delta_esti_gmus00_delta008,family="binomial")
+#  gmus00_beta_delta008<-rbind(gmus00_beta_delta008,t(gmus00_fit$beta))
+#  
+#}
+######## second run till here
+
+
+
+
+n=200
+p=500
+s=10
+beta <- c(rep(1,times=s),rep(0,times=p-s))
+
+summary_estbeta<-function(coef_mat){
+  temp=apply(coef_mat, MARGIN = 1,
+             FUN = function(x){
+               temp<-rep(0,times=p)
+               temp[abs(x)>1e-20]<- 1
+               true_beta_ind<-c(rep(1,s),rep(0,p-s))
+               
+               TP<- sum(temp[1:s]==true_beta_ind[1:s]) #true positive, number of coef correctly predicted !=0
+               TN<- sum(temp[(s+1):p]==true_beta_ind[(s+1):p]) # true negative, number of coef correctky predicted =0
+               FP<- sum(temp[(s+1):p]!=true_beta_ind[(s+1):p]) #false positive, predicted as nonzero coef, but actually zero
+               FN<- sum(temp[1:s]!=true_beta_ind[1:s]) #false negative
+               
+               l1_error<-sum(abs(x-beta))
+               l2_error<-sqrt(sum((x-beta)^2))
+               
+               sensitivity<-TP/(TP+FN)
+               specificity<-TN/(TN+FP)
+               accuracy<-(TP+TN)/(TP+TN+FP+FN)
+               precision<-TP/(TP+FP)
+               return(c(l1_error,l2_error,TP,TN,FP,FN,sensitivity,specificity,accuracy,precision))
+             }
+  )
+  output=as.data.frame(t(temp))
+  colnames(output)<-c("l1_error","l2_error","TP","TN","FP","FN","Sensitivity","Specificity","Accuracy","Precision")
+  return(output)
+}
+
+#save(gmus_beta_006,file="gmus_beta_006_ME02_sample200_largeMENC")
+#save(gmus_beta_005,file="gmus_beta_005_ME02_sample200_largeMENC")
+#save(gmus_beta_004,file="gmus_beta_004_ME02_sample200_largeMENC")
+#save(gmus_beta_003,file="gmus_beta_003_ME02_sample200_largeMENC")
+#save(gmus_beta_002,file="gmus_beta_002_ME02_sample200_largeMENC")
+#save(gmus0_beta_008,file="gmus0_beta_008_ME02_sample200_largeMENC")
+#save(gmus0_beta_006,file="gmus0_beta_006_ME02_sample200_largeMENC")
+#save(gmus0_beta_004,file="gmus0_beta_004_ME02_sample200_largeMENC")
+#save(gmus0_beta_003,file="gmus0_beta_003_ME02_sample200_largeMENC")
+#save(gmus0_beta_002,file="gmus0_beta_002_ME02_sample200_largeMENC")
+#save(gmus00_beta_014,file="gmus00_beta_014_ME02_sample200_largeMENC")
+#save(gmus00_beta_010,file="gmus00_beta_010_ME02_sample200_largeMENC")
+#save(gmus00_beta_008,file="gmus00_beta_008_ME02_sample200_largeMENC")
+#save(gmus00_beta_006,file="gmus00_beta_006_ME02_sample200_largeMENC")
+#save(gmus00_beta_004,file="gmus00_beta_004_ME02_sample200_largeMENC")
+#save(gds_beta,file="gds_beta_ME02_sample200_largeMENC")
+#save(lasso_beta,file="lasso_beta_ME02_sample200_largeMENC")
+
+
+#second run till here  
+
+load(file="gds_beta_ME02_sample200_largeMENC")
+load(file="lasso_beta_ME02_sample200_largeMENC")
+load(file="gmus_beta_002_ME02_sample200_largeMENC")
+load(file="gmus_beta_003_ME02_sample200_largeMENC")
+load(file="gmus_beta_004_ME02_sample200_largeMENC")
+load(file="gmus_beta_005_ME02_sample200_largeMENC")
+load(file="gmus_beta_006_ME02_sample200_largeMENC")
+
+load(file="gmus0_beta_002_ME02_sample200_largeMENC")
+load(file="gmus0_beta_003_ME02_sample200_largeMENC")
+load(file="gmus0_beta_004_ME02_sample200_largeMENC")
+load(file="gmus0_beta_006_ME02_sample200_largeMENC")
+load(file="gmus0_beta_008_ME02_sample200_largeMENC")
+
+load(file="gmus00_beta_004_ME02_sample200_largeMENC")
+load(file="gmus00_beta_006_ME02_sample200_largeMENC")
+load(file="gmus00_beta_008_ME02_sample200_largeMENC")
+load(file="gmus00_beta_010_ME02_sample200_largeMENC")
+load(file="gmus00_beta_014_ME02_sample200_largeMENC")
+
+
+mean(summary_estbeta(gmus_beta_006)[,8],na.rm=T)
+mean(summary_estbeta(gmus_beta_005)[,8],na.rm=T)
+mean(summary_estbeta(gmus_beta_004)[,8],na.rm=T)
+mean(summary_estbeta(gmus_beta_003)[,8],na.rm=T)
+mean(summary_estbeta(gmus_beta_002)[,8],na.rm=T)
+
+mean(summary_estbeta(gmus0_beta_008)[,8],na.rm=T)
+mean(summary_estbeta(gmus0_beta_006)[,8],na.rm=T)
+mean(summary_estbeta(gmus0_beta_004)[,8],na.rm=T)
+mean(summary_estbeta(gmus0_beta_003)[,8],na.rm=T)
+mean(summary_estbeta(gmus0_beta_002)[,8],na.rm=T)
+
+mean(summary_estbeta(gmus00_beta_014)[,8],na.rm=T)
+mean(summary_estbeta(gmus00_beta_010)[,8],na.rm=T)
+mean(summary_estbeta(gmus00_beta_008)[,8],na.rm=T)
+mean(summary_estbeta(gmus00_beta_006)[,8],na.rm=T)
+mean(summary_estbeta(gmus00_beta_004)[,8],na.rm=T)
+
+mean(summary_estbeta(gmus00_beta_delta008)[,8],na.rm=T)
+mean(summary_estbeta(gds_beta)[,8],na.rm=T)
+mean(summary_estbeta(lasso_beta)[,8],na.rm=T)
+
+
+summary_estbeta(gmus_beta)
+summary_estbeta(gmus0_beta)
+summary_estbeta(gmus00_beta)
+summary_estbeta(gmus00_beta_delta008)
+summary_estbeta(gds_beta)
+summary_estbeta(lasso_beta)
+
+
+
+colMeans(summary_estbeta(gmus_beta_006)[summary_estbeta(gmus_beta_006)[,3]!=0,] ,na.rm=T) 
+colMeans(summary_estbeta(gmus_beta_005)[summary_estbeta(gmus_beta_005)[,3]!=0,] ,na.rm=T) 
+colMeans(summary_estbeta(gmus_beta_004)[summary_estbeta(gmus_beta_004)[,3]!=0,] ,na.rm=T) 
+colMeans(summary_estbeta(gmus_beta_003)[summary_estbeta(gmus_beta_003)[,3]!=0,] ,na.rm=T) 
+colMeans(summary_estbeta(gmus_beta_002)[summary_estbeta(gmus_beta_002)[,3]!=0,] ,na.rm=T) 
+
+
+colMeans(summary_estbeta(gmus0_beta_008)[summary_estbeta(gmus0_beta_008)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus0_beta_006)[summary_estbeta(gmus0_beta_006)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus0_beta_004)[summary_estbeta(gmus0_beta_004)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus0_beta_003)[summary_estbeta(gmus0_beta_003)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus0_beta_002)[summary_estbeta(gmus0_beta_002)[,3]!=0,],na.rm=T) 
+
+
+colMeans(summary_estbeta(gmus00_beta_014)[summary_estbeta(gmus00_beta_014)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus00_beta_010)[summary_estbeta(gmus00_beta_010)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus00_beta_008)[summary_estbeta(gmus00_beta_008)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus00_beta_006)[summary_estbeta(gmus00_beta_006)[,3]!=0,],na.rm=T) 
+colMeans(summary_estbeta(gmus00_beta_004)[summary_estbeta(gmus00_beta_004)[,3]!=0,],na.rm=T) 
+
+
+colMeans(summary_estbeta(gds_beta)[summary_estbeta(gds_beta)[,3]!=0,],na.rm=T)
+colMeans(summary_estbeta(lasso_beta)[summary_estbeta(lasso_beta)[,3]!=0,],na.rm=T)
+#colMeans(summary_estbeta(gmus_beta_006))
+#colMeans(summary_estbeta(gmus_beta_005))
+#colMeans(summary_estbeta(gmus_beta_004))
+#colMeans(summary_estbeta(gmus_beta_003))
+#colMeans(summary_estbeta(gmus_beta_002))
+
+#colMeans(summary_estbeta(gmus0_beta_008))
+#colMeans(summary_estbeta(gmus0_beta_006))
+#colMeans(summary_estbeta(gmus0_beta_004))
+#colMeans(summary_estbeta(gmus0_beta_003))
+#colMeans(summary_estbeta(gmus0_beta_002))
+
+#colMeans(summary_estbeta(gmus00_beta_014))
+#colMeans(summary_estbeta(gmus00_beta_010))
+#colMeans(summary_estbeta(gmus00_beta_008))
+#colMeans(summary_estbeta(gmus00_beta_006))
+#colMeans(summary_estbeta(gmus00_beta_004))
+
+#colMeans(summary_estbeta(gds_beta))
+#colMeans(summary_estbeta(lasso_beta))
+
+#mean TP
+mean(summary_estbeta(gmus_beta)[,1],na.rm=T)
+mean(summary_estbeta(gmus0_beta)[,1],na.rm=T)
+mean(summary_estbeta(gmus00_beta)[,1],na.rm=T)
+mean(summary_estbeta(gmus00_beta_delta008)[,1],na.rm=T)
+mean(summary_estbeta(gds_beta)[,1],na.rm=T)
+mean(summary_estbeta(lasso_beta)[,1],na.rm=T)
+
+#mean TN
+mean(summary_estbeta(gmus_beta)[,2],na.rm=T)
+mean(summary_estbeta(gmus0_beta)[,2],na.rm=T)
+mean(summary_estbeta(gmus00_beta)[,2],na.rm=T)
+mean(summary_estbeta(gmus00_beta_delta008)[,2],na.rm=T)
+mean(summary_estbeta(gds_beta)[,2],na.rm=T)
+mean(summary_estbeta(lasso_beta)[,2],na.rm=T)
+
+#mean Fp
+mean(summary_estbeta(gmus_beta)[,3],na.rm=T)
+mean(summary_estbeta(gmus0_beta)[,3],na.rm=T)
+mean(summary_estbeta(gmus00_beta)[,3],na.rm=T)
+mean(summary_estbeta(gmus00_beta_delta008)[,3],na.rm=T)
+mean(summary_estbeta(gds_beta)[,3],na.rm=T)
+mean(summary_estbeta(lasso_beta)[,3],na.rm=T)
