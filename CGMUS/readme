@@ -1,0 +1,13 @@
+The Covariate-specific Generalized Matrix Uncertainty Selector is modified based on Generalized Matrix Uncertainty Selector 
+from the hdme package (https://github.com/osorensen/hdme).
+
+@article{sorensen2018covariate,
+  title={Covariate selection in high-dimensional generalized linear models with measurement error},
+  author={S{\o}rensen, {\O}ystein and Hellton, Kristoffer Herland and Frigessi, Arnoldo and Thoresen, Magne},
+  journal={Journal of Computational and Graphical Statistics},
+  volume={27},
+  number={4},
+  pages={739--749},
+  year={2018},
+  publisher={Taylor \& Francis}
+}
